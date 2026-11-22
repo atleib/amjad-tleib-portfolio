@@ -1,0 +1,206 @@
+name: CI/CD
+
+# Pull requests: test + terraform plan (read-only role).
+# Pushes to main: test + terraform apply + build + upload to S3 + CloudFront invalidation.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # lets the job request an OIDC token to assume the AWS role
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22"
+  TF_VERSION: "1.13.0"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ------------------------------------------------------------
+  test:
+    name: Lint, type-check and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+
+      - name: Install (site)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Install, type-check, test and build (backend)
+        working-directory: backend
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Upload backend bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-dist
+          path: backend/dist
+          retention-days: 1
+
+      - name: Build site (for e2e tests)
+        run: npm run build
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          retention-days: 7
+
+  # ------------------------------------------------------------
+  infra:
+    name: Terraform ${{ github.event_name == 'pull_request' && 'plan' || 'apply' }}
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/main
+    env:
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+      TF_VAR_notification_email: ${{ vars.NOTIFICATION_EMAIL }}
+      TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+    outputs:
+      site_bucket: ${{ steps.out.outputs.site_bucket }}
+      distribution_id: ${{ steps.out.outputs.distribution_id }}
+      api_url: ${{ steps.out.outputs.api_url }}
+      site_url: ${{ steps.out.outputs.site_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download backend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+          path: backend/dist
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false # so `terraform output -raw` prints clean values
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN || vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        run: >
+          terraform init -input=false
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=portfolio/main.tfstate"
+          -backend-config="region=${{ vars.AWS_REGION }}"
+          -backend-config="use_lockfile=true"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -out=tfplan
+          {
+            echo '## Terraform plan'
+            echo '```'
+            terraform show -no-color tfplan | tail -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: terraform apply -input=false tfplan
+
+      - name: Read outputs
+        id: out
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          for name in site_bucket distribution_id api_url site_url; do
+            echo "$name=$(terraform output -raw $name)" >> "$GITHUB_OUTPUT"
+          done
+
+  # ------------------------------------------------------------
+  deploy:
+    name: Build and deploy site
+    needs: infra
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Note: adding a GitHub "environment" here would change the OIDC subject claim
+    # (repo:...:environment:<name>), so the deploy role's trust policy would need updating too.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build site
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ needs.infra.outputs.api_url }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload to S3
+        env:
+          BUCKET: ${{ needs.infra.outputs.site_bucket }}
+        run: |
+          # Hashed build assets never change, so browsers can cache them for a year.
+          aws s3 sync out/_next/static "s3://$BUCKET/_next/static" \
+            --cache-control "public, max-age=31536000, immutable"
+          # Everything else (HTML, images) must be revalidated so updates show up.
+          aws s3 sync out "s3://$BUCKET" --delete \
+            --exclude "_next/static/*" \
+            --cache-control "public, max-age=0, must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: >
+          aws cloudfront create-invalidation
+          --distribution-id "${{ needs.infra.outputs.distribution_id }}"
+          --paths "/*"
+
+      - name: Summary
+        run: echo "Deployed to ${{ needs.infra.outputs.site_url }}" >> "$GITHUB_STEP_SUMMARY"

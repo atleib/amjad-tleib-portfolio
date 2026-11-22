@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars for local runs (it's git-ignored).
+# In CI these come from GitHub repository variables instead.
+
+notification_email = "you@example.com"
+
+# Optional: a domain with a Route 53 hosted zone. Leave empty to use the CloudFront URL.
+domain_name = ""
